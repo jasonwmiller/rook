@@ -18,65 +18,109 @@ package installer
 
 import (
 	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"os"
+	"path"
+	"runtime"
+	"strings"
+	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/api/core/v1"
+	"k8s.io/kubernetes/pkg/kubelet/apis"
 
-	"strings"
+	"flag"
 
 	"github.com/coreos/pkg/capnslog"
+	cephv1beta1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1beta1"
+	rookalpha "github.com/rook/rook/pkg/apis/rook.io/v1alpha2"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/cluster/osd/config"
+	"github.com/rook/rook/pkg/util/exec"
+	"github.com/rook/rook/pkg/util/sys"
 	"github.com/rook/rook/tests/framework/objects"
 	"github.com/rook/rook/tests/framework/utils"
-	utilversion "k8s.io/kubernetes/pkg/util/version"
+	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
-	rookOperatorCreatedTpr = "cluster.rook.io"
-	rookOperatorCreatedCrd = "clusters.rook.io"
+	rookOperatorCreatedCrd = "clusters.ceph.rook.io"
+	cockroachDBCRD         = "clusters.cockroachdb.rook.io"
+	helmChartName          = "local/rook-ceph"
+	helmDeployName         = "rook-ceph"
 )
 
 var (
-	logger         = capnslog.NewPackageLogger("github.com/rook/rook", "installer")
-	createArgs     = []string{"create", "-f", "-"}
-	deleteArgs     = []string{"delete", "-f", "-"}
-	helmChartName  = "local/rook"
-	helmDeployName = "rook"
-	env            objects.EnvironmentManifest
+	// ** Variables that might need to be changed depending on the dev environment. The init function below will modify some of them automatically. **
+	baseTestDir       string
+	forceUseDevices   = false
+	createBaseTestDir = true
+	// ** end of Variables to modify
+	logger              = capnslog.NewPackageLogger("github.com/rook/rook", "installer")
+	createArgs          = []string{"create", "-f"}
+	createFromStdinArgs = append(createArgs, "-")
+	deleteArgs          = []string{"delete", "-f"}
+	deleteFromStdinArgs = append(deleteArgs, "-")
 )
+
+func init() {
+	// this default will only work if running kubernetes on the local machine
+	baseTestDir, _ = os.Getwd()
+
+	// The following settings could apply to any environment when the kube context is running on the host and the tests are running inside a
+	// VM such as minikube. This is a cheap test for this condition, we need to find a better way to automate these settings.
+	if runtime.GOOS == "darwin" {
+		createBaseTestDir = false
+		baseTestDir = "/data"
+	}
+}
 
 //InstallHelper wraps installing and uninstalling rook on a platform
 type InstallHelper struct {
-	k8shelper   *utils.K8sHelper
-	installData *InstallData
-	helmHelper  *utils.HelmHelper
-	Env         objects.EnvironmentManifest
+	k8shelper        *utils.K8sHelper
+	installData      *InstallData
+	hostPathToDelete string
+	helmHelper       *utils.HelmHelper
+	Env              objects.EnvironmentManifest
+	k8sVersion       string
+	T                func() *testing.T
 }
 
-func init() {
-	env = objects.NewManifest()
+func (h *InstallHelper) CreateK8sRookResources() (err error) {
+	var resources string
+	logger.Info("Creating Rook CRDs")
+
+	resources = h.installData.GetRookCRDs()
+
+	_, err = h.k8shelper.KubectlWithStdin(resources, createFromStdinArgs...)
+
+	return
 }
 
 //CreateK8sRookOperator creates rook-operator via kubectl
-func (h *InstallHelper) CreateK8sRookOperator() (err error) {
+func (h *InstallHelper) CreateK8sRookOperator(namespace string) (err error) {
 	logger.Infof("Starting Rook Operator")
+	//creating clusterrolebinding for kubeadm env.
+	h.k8shelper.CreateAnonSystemClusterBinding()
 
-	rookOperator := h.installData.getRookOperator(h.k8shelper.GetK8sServerVersion())
+	//creating rook resources
+	if err = h.CreateK8sRookResources(); err != nil {
+		return err
+	}
 
-	_, err = h.k8shelper.KubectlWithStdin(rookOperator, createArgs...)
+	rookOperator := h.installData.GetRookOperator(namespace)
 
+	_, err = h.k8shelper.KubectlWithStdin(rookOperator, createFromStdinArgs...)
 	if err != nil {
 		return fmt.Errorf("Failed to create rook-operator pod : %v ", err)
 	}
-	kubeVersion := utilversion.MustParseSemantic(h.k8shelper.GetK8sServerVersion())
 
-	if kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.7.0")) {
-		if !h.k8shelper.IsCRDPresent(rookOperatorCreatedCrd) {
-			return fmt.Errorf("Failed to start Rook Operator; k8s CustomResourceDefinition did not appear")
-		}
-	} else {
-		if !h.k8shelper.IsThirdPartyResourcePresent(rookOperatorCreatedTpr) {
-			return fmt.Errorf("Failed to start Rook Operator; k8s thirdpartyresource did not appear")
-		}
+	if !h.k8shelper.IsCRDPresent(rookOperatorCreatedCrd) {
+		return fmt.Errorf("Failed to start Rook Operator; k8s CustomResourceDefinition did not appear")
 	}
 
 	logger.Infof("Rook Operator started")
@@ -84,10 +128,10 @@ func (h *InstallHelper) CreateK8sRookOperator() (err error) {
 	return nil
 }
 
-//CreateK8sRookOperatorViaHelm creates rook operator via Execute chart named local/rook present in local repo
-func (h *InstallHelper) CreateK8sRookOperatorViaHelm() (err error) {
+//CreateK8sRookOperatorViaHelm creates rook operator via Helm chart named local/rook present in local repo
+func (h *InstallHelper) CreateK8sRookOperatorViaHelm(namespace string) error {
 	//creating clusterrolebinding for kubeadm env.
-	h.k8shelper.Kubectl([]string{"create", "clusterrolebinding", "anon-user-access", "--clusterrole", "cluster-admin", "--user", "system:anonymous"}...)
+	h.k8shelper.CreateAnonSystemClusterBinding()
 
 	helmTag, err := h.helmHelper.GetLocalRookHelmChartVersion(helmChartName)
 
@@ -95,40 +139,32 @@ func (h *InstallHelper) CreateK8sRookOperatorViaHelm() (err error) {
 		return fmt.Errorf("Failed to get Version of helm chart %v, err : %v", helmChartName, err)
 	}
 
-	err = h.helmHelper.InstallLocalRookHelmChart(helmChartName, helmDeployName, helmTag, "rook")
+	err = h.helmHelper.InstallLocalRookHelmChart(helmChartName, helmDeployName, helmTag, namespace)
 	if err != nil {
-		return fmt.Errorf("failed toinstall rook operator via helm, err : %v", err)
+		return fmt.Errorf("failed to install rook operator via helm, err : %v", err)
 
 	}
 
-	kubeVersion := utilversion.MustParseSemantic(h.k8shelper.GetK8sServerVersion())
-
-	if kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.7.0")) {
-		if !h.k8shelper.IsCRDPresent(rookOperatorCreatedCrd) {
-			return fmt.Errorf("Failed to start Rook Operator; k8s CustomResourceDefinition did not appear")
-		}
-	} else {
-		if !h.k8shelper.IsThirdPartyResourcePresent(rookOperatorCreatedTpr) {
-			return fmt.Errorf("Failed to start Rook Operator; k8s thirdpartyresource did not appear")
-		}
+	if !h.k8shelper.IsCRDPresent(rookOperatorCreatedCrd) {
+		return fmt.Errorf("Failed to start Rook Operator; k8s CustomResourceDefinition did not appear")
 	}
 
 	return nil
 }
 
-//CreateK8sRookToolbox creates rook-tools via kubectl
-func (h *InstallHelper) CreateK8sRookToolbox() (err error) {
+//CreateK8sRookToolbox creates rook-ceph-tools via kubectl
+func (h *InstallHelper) CreateK8sRookToolbox(namespace string) (err error) {
 	logger.Infof("Starting Rook toolbox")
 
-	rookToolbox := h.installData.getRookToolBox()
+	rookToolbox := h.installData.GetRookToolBox(namespace)
 
-	_, err = h.k8shelper.KubectlWithStdin(rookToolbox, createArgs...)
+	_, err = h.k8shelper.KubectlWithStdin(rookToolbox, createFromStdinArgs...)
 
 	if err != nil {
 		return fmt.Errorf("Failed to create rook-toolbox pod : %v ", err)
 	}
 
-	if !h.k8shelper.IsPodRunningInNamespace("rook-tools") {
+	if !h.k8shelper.IsPodRunning("rook-ceph-tools", namespace) {
 		return fmt.Errorf("Rook Toolbox couldn't start")
 	}
 	logger.Infof("Rook Toolbox started")
@@ -136,249 +172,413 @@ func (h *InstallHelper) CreateK8sRookToolbox() (err error) {
 	return nil
 }
 
-//CreateK8sRookCluster creates rook cluster via kubectl
-func (h *InstallHelper) CreateK8sRookCluster() (err error) {
-	logger.Infof("Starting Rook Cluster")
-
-	rookCluster := h.installData.getRookCluster()
-
-	_, err = h.k8shelper.KubectlWithStdin(rookCluster, createArgs...)
-
-	if err != nil {
-		return fmt.Errorf("Failed to create rook cluster : %v ", err)
-	}
-
-	if !h.k8shelper.IsServiceUpInNameSpace("rook-api") {
-		logger.Infof("Rook Cluster couldn't start")
-	} else {
-		logger.Infof("Rook Cluster started")
-	}
-
-	return nil
+func (h *InstallHelper) CreateK8sRookCluster(namespace, systemNamespace string, storeType string) (err error) {
+	return h.CreateK8sRookClusterWithHostPathAndDevices(namespace, systemNamespace, storeType, false,
+		cephv1beta1.MonSpec{Count: 3, AllowMultiplePerNode: true}, true /* startWithAllNodes */)
 }
 
-//InstallRookOnK8s installs rook on k8s
-func (h *InstallHelper) InstallRookOnK8s() (err error) {
-	//creating clusterrolebinding for kubeadm env.
-	h.k8shelper.Kubectl([]string{"create", "clusterrolebinding", "anon-user-access", "--clusterrole", "cluster-admin", "--user", "system:anonymous"}...)
+//CreateK8sRookCluster creates rook cluster via kubectl
+func (h *InstallHelper) CreateK8sRookClusterWithHostPathAndDevices(namespace, systemNamespace, storeType string,
+	useAllDevices bool, mon cephv1beta1.MonSpec, startWithAllNodes bool) error {
 
+	dataDirHostPath, err := h.initTestDir(namespace)
+	if err != nil {
+		return fmt.Errorf("failed to create test dir. %+v", err)
+	}
+	logger.Infof("Creating cluster: namespace=%s, systemNamespace=%s, storeType=%s, dataDirHostPath=%s, useAllDevices=%t, startWithAllNodes=%t, mons=%+v",
+		namespace, systemNamespace, storeType, dataDirHostPath, useAllDevices, startWithAllNodes, mon)
+
+	logger.Infof("Creating namespace %s", namespace)
+	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+	_, err = h.k8shelper.Clientset.CoreV1().Namespaces().Create(ns)
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create namespace %s. %+v", namespace, err)
+	}
+
+	logger.Infof("Creating cluster roles")
+	roles := h.installData.GetClusterRoles(namespace, systemNamespace)
+	if _, err := h.k8shelper.KubectlWithStdin(roles, createFromStdinArgs...); err != nil {
+		return fmt.Errorf("Failed to create cluster roles. %+v", err)
+	}
+
+	if h.k8shelper.IsRookClientsetAvailable() {
+		logger.Infof("Starting Rook cluster with strongly typed clientset")
+
+		clust := &cephv1beta1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      namespace,
+				Namespace: namespace,
+			},
+			Spec: cephv1beta1.ClusterSpec{
+				ServiceAccount:  "rook-ceph-cluster",
+				DataDirHostPath: dataDirHostPath,
+				Mon: cephv1beta1.MonSpec{
+					Count:                mon.Count,
+					AllowMultiplePerNode: mon.AllowMultiplePerNode,
+				},
+				Storage: rookalpha.StorageScopeSpec{
+					UseAllNodes: startWithAllNodes,
+					Selection: rookalpha.Selection{
+						UseAllDevices: &useAllDevices,
+					},
+					Config: map[string]string{
+						config.StoreTypeKey:      storeType,
+						config.DatabaseSizeMBKey: "1024",
+						config.JournalSizeMBKey:  "1024",
+					},
+				},
+			},
+		}
+		_, err := h.k8shelper.RookClientset.CephV1beta1().Clusters(namespace).Create(clust)
+		if err != nil {
+			return fmt.Errorf("failed to create cluster %s. %+v", clust.Name, err)
+		}
+
+		if !startWithAllNodes {
+			// now that the cluster is created, let's get all the k8s nodes so we can update the cluster CRD with them
+			logger.Info("cluster was started without all nodes, will update cluster to add nodes now.")
+			nodeNames, err := h.GetNodeHostnames()
+			if err != nil {
+				return fmt.Errorf("failed to get k8s nodes to add to cluster CRD: %+v", err)
+			}
+
+			// add all discovered k8s nodes to the cluster CRD
+			rookNodes := make([]rookalpha.Node, len(nodeNames))
+			for i, hostname := range nodeNames {
+				rookNodes[i] = rookalpha.Node{Name: hostname}
+			}
+			clust, err = h.k8shelper.RookClientset.CephV1beta1().Clusters(namespace).Get(namespace, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to get rook cluster to add nodes to it: %+v", err)
+			}
+			clust.Spec.Storage.Nodes = rookNodes
+
+			// update the cluster CRD now
+			_, err = h.k8shelper.RookClientset.CephV1beta1().Clusters(namespace).Update(clust)
+			if err != nil {
+				return fmt.Errorf("failed to update cluster %s with nodes. %+v", clust.Name, err)
+			}
+		}
+	} else {
+		logger.Infof("Starting Rook Cluster with yaml")
+		rookCluster := h.installData.GetRookCluster(namespace, storeType, dataDirHostPath, useAllDevices, mon.Count)
+		if _, err := h.k8shelper.KubectlWithStdin(rookCluster, createFromStdinArgs...); err != nil {
+			return fmt.Errorf("Failed to create rook cluster : %v ", err)
+		}
+	}
+
+	if err := h.k8shelper.WaitForPodCount("app=rook-ceph-mon", namespace, mon.Count); err != nil {
+		return err
+	}
+
+	if err := h.k8shelper.WaitForPodCount("app=rook-ceph-osd", namespace, 1); err != nil {
+		return err
+	}
+
+	logger.Infof("Rook Cluster started")
+	err = h.k8shelper.WaitForLabeledPodToRun("app=rook-ceph-osd", namespace)
+	return err
+}
+
+func (h *InstallHelper) initTestDir(namespace string) (string, error) {
+	h.hostPathToDelete = path.Join(baseTestDir, "rook-test")
+	testDir := path.Join(h.hostPathToDelete, namespace)
+
+	if createBaseTestDir {
+		// Create the test dir on the local host
+		if err := os.MkdirAll(testDir, 0777); err != nil {
+			return "", err
+		}
+
+		var err error
+		if testDir, err = ioutil.TempDir(testDir, "test-"); err != nil {
+			return "", err
+		}
+	} else {
+		// Compose a random test directory name without actually creating it since not running on the localhost
+		r := rand.Int()
+		testDir = path.Join(testDir, fmt.Sprintf("test-%d", r))
+	}
+	return testDir, nil
+}
+
+func (h *InstallHelper) GetNodeHostnames() ([]string, error) {
+	nodes, err := h.k8shelper.Clientset.CoreV1().Nodes().List(metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get k8s nodes. %+v", err)
+	}
+	var names []string
+	for _, node := range nodes.Items {
+		names = append(names, node.Labels[apis.LabelHostname])
+	}
+
+	return names, nil
+}
+
+func SystemNamespace(namespace string) string {
+	return fmt.Sprintf("%s-system", namespace)
+}
+
+//InstallRookOnK8sWithHostPathAndDevices installs rook on k8s
+func (h *InstallHelper) InstallRookOnK8sWithHostPathAndDevices(namespace, storeType string,
+	helmInstalled, useDevices bool, mon cephv1beta1.MonSpec, startWithAllNodes bool) (bool, error) {
+
+	var err error
 	//flag used for local debuggin purpose, when rook is pre-installed
-	skipRookInstall := strings.EqualFold(h.Env.SkipInstallRook, "true")
-	if skipRookInstall {
-		return
+	if h.Env.SkipInstallRook {
+		return true, nil
 	}
 
 	k8sversion := h.k8shelper.GetK8sServerVersion()
 
 	logger.Infof("Installing rook on k8s %s", k8sversion)
+
+	onamespace := namespace
 	//Create rook operator
-	if err != nil {
-		panic(err)
+	if helmInstalled {
+		err = h.CreateK8sRookOperatorViaHelm(namespace)
+		if err != nil {
+			logger.Errorf("Rook Operator not installed ,error -> %v", err)
+			return false, err
+
+		}
+	} else {
+		onamespace = SystemNamespace(namespace)
+
+		err := h.CreateK8sRookOperator(onamespace)
+		if err != nil {
+			logger.Errorf("Rook Operator not installed ,error -> %v", err)
+			return false, err
+		}
+	}
+	if !h.k8shelper.IsPodInExpectedState("rook-ceph-operator", onamespace, "Running") {
+		logger.Error("rook-ceph-operator is not running")
+		h.k8shelper.GetRookLogs("rook-ceph-operator", h.Env.HostType, onamespace, "test-setup")
+		logger.Error("rook-ceph-operator is not Running, abort!")
+		return false, err
 	}
 
-	err = h.CreateK8sRookOperator()
-	if err != nil {
-		fmt.Println(err)
-		panic(err)
+	if forceUseDevices {
+		logger.Infof("Forcing the use of devices")
+		useDevices = true
+	} else if useDevices {
+		// This check only looks at the local machine for devices. If you want to force using devices,
+		// set the forceUseDevices flag
+		useDevices = IsAdditionalDeviceAvailableOnCluster()
 	}
-
-	if !h.k8shelper.IsPodInExpectedState("rook-operator", "default", "Running") {
-		fmt.Println("rook-operator is not running")
-		h.k8shelper.GetRookLogs("rook-operator", "default", "test-setup")
-		panic("rook-operator is not Running, abort!")
-	}
-
-	time.Sleep(10 * time.Second)
 
 	//Create rook cluster
-	err = h.CreateK8sRookCluster()
+	err = h.CreateK8sRookClusterWithHostPathAndDevices(namespace, onamespace, storeType,
+		useDevices, cephv1beta1.MonSpec{Count: mon.Count, AllowMultiplePerNode: mon.AllowMultiplePerNode}, startWithAllNodes)
 	if err != nil {
-		panic(err)
+		logger.Errorf("Rook cluster %s not installed, error -> %v", namespace, err)
+		return false, err
 	}
-
-	time.Sleep(5 * time.Second)
 
 	//Create rook client
-	err = h.CreateK8sRookToolbox()
+	err = h.CreateK8sRookToolbox(namespace)
 	if err != nil {
-		panic(err)
+		logger.Errorf("Rook toolbox in cluster %s not installed, error -> %v", namespace, err)
+		return false, err
 	}
-	logger.Infof("installed rook on k8s %s", h.Env.K8sVersion)
-	return nil
+	logger.Infof("installed rook operator and cluster : %s on k8s %s", namespace, h.k8sVersion)
+	return true, nil
 }
 
 //UninstallRookFromK8s uninstalls rook from k8s
-func (h *InstallHelper) UninstallRookFromK8s() {
-	//flag used for local debugging purpose, when rook is pre-installed
-	skipRookInstall := strings.EqualFold(h.Env.SkipInstallRook, "true")
-	if skipRookInstall {
-		return
-	}
-	k8sVersion := h.k8shelper.GetK8sServerVersion()
-	serverVersion, err := h.k8shelper.Clientset.Discovery().ServerVersion()
-	if err != nil {
-		panic(err)
-	}
-	kubeVersion := utilversion.MustParseSemantic(serverVersion.GitVersion)
-
-	logger.Infof("Uninstalling Rook")
-	k8sHelp, err := utils.CreateK8sHelper()
-	if err != nil {
-		panic(err)
-	}
-	rookOperator := h.installData.getRookOperator(k8sVersion)
-
-	_, err = h.k8shelper.KubectlWithStdin(rookOperator, deleteArgs...)
-	if err != nil {
-		panic(err)
-	}
-	_, err = k8sHelp.DeleteResource([]string{"-n", "rook", "cluster", "rook"})
-	if err != nil {
-		panic(err)
-	}
-	_, err = k8sHelp.DeleteResource([]string{"-n", "rook", "serviceaccount", "rook-api"})
-	if err != nil {
-		panic(err)
-	}
-	if kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.6.0")) {
-		_, err = k8sHelp.DeleteResource([]string{"clusterrole", "rook-api"})
-		if err != nil {
-			panic(err)
-		}
-		_, err = k8sHelp.DeleteResource([]string{"clusterrolebinding", "rook-api"})
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	if kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.7.0")) {
-		_, err = k8sHelp.DeleteResource([]string{"crd", "clusters.rook.io", "pools.rook.io"})
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		_, err = k8sHelp.DeleteResource([]string{"thirdpartyresources", "cluster.rook.io", "pool.rook.io"})
-		if err != nil {
-			panic(err)
-		}
-	}
-	_, err = k8sHelp.DeleteResource([]string{"secret", "rook-rook-user"})
-	if err != nil {
-		panic(err)
-	}
-	_, err = k8sHelp.DeleteResource([]string{"namespace", "rook"})
-	if err != nil {
-		panic(err)
-	}
-
-	isRookUninstalled := k8sHelp.WaitUntilPodInNamespaceIsDeleted("rook-ceph-mon", "rook")
-	isNameSpaceDeleted := k8sHelp.WaitUntilNameSpaceIsDeleted("rook")
-	h.k8shelper.Clientset.RbacV1beta1().ClusterRoleBindings().Delete("anon-user-access", nil)
-
-	time.Sleep(time.Second * 10)
-
-	if isRookUninstalled && isNameSpaceDeleted {
-		logger.Infof("Rook uninstalled successfully")
-		return
-	}
-	panic(fmt.Errorf("Rook not uninstalled"))
+func (h *InstallHelper) UninstallRook(helmInstalled bool, namespace string) {
+	h.UninstallRookFromMultipleNS(helmInstalled, SystemNamespace(namespace), namespace)
 }
 
-//UninstallRookFromK8sViaHelm uninstalls rook from k8s and deletes helm deploy
-func (h *InstallHelper) UninstallRookFromK8sViaHelm() {
+//UninstallRookFromK8s uninstalls rook from multiple namespaces in k8s
+func (h *InstallHelper) UninstallRookFromMultipleNS(helmInstalled bool, systemNamespace string, namespaces ...string) {
 	//flag used for local debugging purpose, when rook is pre-installed
-	skipRookInstall := strings.EqualFold(h.Env.SkipInstallRook, "true")
-	if skipRookInstall {
+	if h.Env.SkipInstallRook {
 		return
 	}
-
-	serverVersion, err := h.k8shelper.Clientset.Discovery().ServerVersion()
-	if err != nil {
-		panic(err)
-	}
-	kubeVersion := utilversion.MustParseSemantic(serverVersion.GitVersion)
 
 	logger.Infof("Uninstalling Rook")
-	k8sHelp, err := utils.CreateK8sHelper()
-	if err != nil {
-		panic(err)
+	var err error
+	for _, namespace := range namespaces {
+
+		if !h.k8shelper.VersionAtLeast("v1.8.0") {
+			_, err = h.k8shelper.DeleteResource("-n", namespace, "serviceaccount", "rook-ceph-cluster")
+			h.checkError(err, "cannot remove serviceaccount rook-ceph-cluster")
+			assert.NoError(h.T(), err, "%s  err -> %v", namespace, err)
+
+			err = h.k8shelper.DeleteRoleAndBindings("rook-ceph-cluster", namespace)
+			h.checkError(err, "rook-ceph-cluster cluster role and binding cannot be deleted")
+			assert.NoError(h.T(), err, "rook-ceph-cluster cluster role and binding cannot be deleted: %+v", err)
+
+			err = h.k8shelper.DeleteRoleBinding("rook-ceph-cluster-mgmt", namespace)
+			h.checkError(err, "rook-ceph-cluster-mgmt binding cannot be deleted")
+			assert.NoError(h.T(), err, "rook-ceph-cluster-mgmt binding cannot be deleted: %+v", err)
+		}
+
+		_, err = h.k8shelper.DeleteResourceAndWait(false, "-n", namespace, "cluster.ceph.rook.io", namespace)
+		h.checkError(err, fmt.Sprintf("cannot remove cluster %s", namespace))
+
+		crdCheckerFunc := func() error {
+			_, err := h.k8shelper.RookClientset.RookV1alpha1().Clusters(namespace).Get(namespace, metav1.GetOptions{})
+			return err
+		}
+		err = h.waitForCustomResourceDeletion(namespace, crdCheckerFunc)
+		h.checkError(err, fmt.Sprintf("failed to wait for crd %s deletion", namespace))
+
+		_, err = h.k8shelper.DeleteResourceAndWait(false, "namespace", namespace)
+		h.checkError(err, fmt.Sprintf("cannot delete namespace %s", namespace))
 	}
 
-	err = h.helmHelper.DeleteLocalRookHelmChart(helmDeployName)
-	if err != nil {
-		panic(err)
-	}
+	logger.Infof("removing the operator from namespace %s", systemNamespace)
+	_, err = h.k8shelper.DeleteResource("crd", "clusters.ceph.rook.io", "pools.ceph.rook.io", "objectstores.ceph.rook.io", "filesystems.ceph.rook.io", "volumes.rook.io")
+	h.checkError(err, "cannot delete CRDs")
 
-	_, err = k8sHelp.DeleteResource([]string{"-n", "rook", "cluster", "rook"})
-	if err != nil {
-		panic(err)
-	}
-	_, err = k8sHelp.DeleteResource([]string{"-n", "rook", "serviceaccount", "rook-api"})
-	if err != nil {
-		panic(err)
-	}
-	if kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.6.0")) {
-		_, err = k8sHelp.DeleteResource([]string{"clusterrole", "rook-api"})
-		if err != nil {
-			panic(err)
-		}
-		_, err = k8sHelp.DeleteResource([]string{"clusterrolebinding", "rook-api"})
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	if kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.7.0")) {
-		_, err = k8sHelp.DeleteResource([]string{"crd", "clusters.rook.io", "pools.rook.io"})
-		if err != nil {
-			panic(err)
-		}
+	if helmInstalled {
+		err = h.helmHelper.DeleteLocalRookHelmChart(helmDeployName)
 	} else {
-		_, err = k8sHelp.DeleteResource([]string{"thirdpartyresources", "cluster.rook.io", "pool.rook.io"})
-		if err != nil {
-			panic(err)
+		rookOperator := h.installData.GetRookOperator(systemNamespace)
+		_, err = h.k8shelper.KubectlWithStdin(rookOperator, deleteFromStdinArgs...)
+	}
+	h.checkError(err, "cannot uninstall rook-operator")
+
+	h.k8shelper.Clientset.RbacV1beta1().RoleBindings(systemNamespace).Delete("rook-ceph-system", nil)
+	h.k8shelper.Clientset.RbacV1beta1().ClusterRoleBindings().Delete("rook-ceph-global", nil)
+	h.k8shelper.Clientset.CoreV1().ServiceAccounts(systemNamespace).Delete("rook-ceph-system", nil)
+	h.k8shelper.Clientset.RbacV1beta1().ClusterRoles().Delete("rook-ceph-cluster-mgmt", nil)
+	h.k8shelper.Clientset.RbacV1beta1().ClusterRoles().Delete("rook-ceph-global", nil)
+	h.k8shelper.Clientset.RbacV1beta1().Roles(systemNamespace).Delete("rook-ceph-system", nil)
+
+	logger.Infof("done removing the operator from namespace %s", systemNamespace)
+	logger.Infof("removing host data dir %s", h.hostPathToDelete)
+	// removing data dir if exists
+	if h.hostPathToDelete != "" {
+		nodes, err := h.GetNodeHostnames()
+		h.checkError(err, "cannot get node names")
+		for _, node := range nodes {
+			err = h.cleanupDir(node, h.hostPathToDelete)
+			logger.Infof("removing %s from node %s. err=%v", h.hostPathToDelete, node, err)
 		}
 	}
-	_, err = k8sHelp.DeleteResource([]string{"secret", "rook-rook-user"})
-	if err != nil {
-		panic(err)
-	}
-	_, err = k8sHelp.DeleteResource([]string{"namespace", "rook"})
-	if err != nil {
-		panic(err)
-	}
+}
 
-	isRookUninstalled := k8sHelp.WaitUntilPodInNamespaceIsDeleted("rook-ceph-mon", "rook")
-	isNameSpaceDeleted := k8sHelp.WaitUntilNameSpaceIsDeleted("rook")
-	h.k8shelper.Clientset.RbacV1beta1().ClusterRoleBindings().Delete("anon-user-access", nil)
+func (h *InstallHelper) cleanupDir(node, dir string) error {
+	resources := h.installData.GetCleanupPod(node, dir)
+	_, err := h.k8shelper.KubectlWithStdin(resources, createFromStdinArgs...)
+	return err
+}
 
-	time.Sleep(time.Second * 10)
-
-	if isRookUninstalled && isNameSpaceDeleted {
-		logger.Infof("Rook uninstalled successfully")
+func (h *InstallHelper) checkError(err error, message string) {
+	// During cleanup the resource might not be found because the test might have failed before the test was done and never created the resource
+	if err == nil || errors.IsNotFound(err) {
 		return
 	}
-	panic(fmt.Errorf("Rook not uninstalled"))
+	assert.NoError(h.T(), err, "%s. %+v", message, err)
+}
+
+func (h *InstallHelper) waitForCustomResourceDeletion(namespace string, checkerFunc func() error) error {
+	if !h.k8shelper.VersionAtLeast("v1.8.0") {
+		// v1.7 has an intermittent issue with long delay to delete resources so we will skip waiting
+		return nil
+	}
+
+	// wait for the operator to finalize and delete the CRD
+	for i := 0; i < 10; i++ {
+		err := checkerFunc()
+		if err == nil {
+			logger.Infof("custom resource %s still exists", namespace)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if errors.IsNotFound(err) {
+			logger.Infof("custom resource %s deleted", namespace)
+			return nil
+		}
+		return err
+	}
+	logger.Errorf("gave up deleting custom resource %s", namespace)
+	return nil
+}
+
+func (h *InstallHelper) GatherAllRookLogs(namespace, systemNamespace string, testName string) {
+	logger.Infof("Gathering all logs from Rook Cluster %s", namespace)
+	h.k8shelper.GetRookLogs("rook-ceph-operator", h.Env.HostType, systemNamespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-agent", h.Env.HostType, systemNamespace, testName)
+	h.k8shelper.GetRookLogs("rook-discover", h.Env.HostType, systemNamespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-mgr", h.Env.HostType, namespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-mon", h.Env.HostType, namespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-osd", h.Env.HostType, namespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-osd-prepare", h.Env.HostType, namespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-rgw", h.Env.HostType, namespace, testName)
+	h.k8shelper.GetRookLogs("rook-ceph-mds", h.Env.HostType, namespace, testName)
 }
 
 //NewK8sRookhelper creates new instance of InstallHelper
-func NewK8sRookhelper(clientset *kubernetes.Clientset) *InstallHelper {
+func NewK8sRookhelper(clientset *kubernetes.Clientset, t func() *testing.T) *InstallHelper {
+
+	// All e2e tests should run ceph commands in the toolbox since we are not inside a container
+	client.RunAllCephCommandsInToolbox = true
 
 	version, err := clientset.ServerVersion()
 	if err != nil {
 		logger.Infof("failed to get kubectl server version. %+v", err)
-	} else {
-		env.K8sVersion = version.String()
 	}
 
-	k8shelp, err := utils.CreateK8sHelper()
+	k8shelp, err := utils.CreateK8sHelper(t)
 	if err != nil {
 		panic("failed to get kubectl client :" + err.Error())
 	}
-	return &InstallHelper{
+	ih := &InstallHelper{
 		k8shelper:   k8shelp,
 		installData: NewK8sInstallData(),
 		helmHelper:  utils.NewHelmHelper(),
-		Env:         env,
+		Env:         objects.Env,
+		k8sVersion:  version.String(),
+		T:           t,
 	}
+	flag.Parse()
+	return ih
+}
+
+func IsAdditionalDeviceAvailableOnCluster() bool {
+	executor := &exec.CommandExecutor{}
+	devices, err := sys.ListDevices(executor)
+	if err != nil {
+		return false
+	}
+	disks := 0
+	logger.Infof("devices : %v", devices)
+	for _, device := range devices {
+		if strings.Contains(device, "loop") {
+			continue
+		}
+		props, _ := sys.GetDeviceProperties(device, executor)
+		if props["TYPE"] != "disk" {
+			continue
+		}
+
+		ownPartitions, fs, err := sys.CheckIfDeviceAvailable(executor, device)
+		if err != nil {
+			logger.Warningf("failed to detect device %s availability. %+v", device, err)
+			continue
+		}
+		if !ownPartitions {
+			logger.Infof("skipping device %s since don't own partitions", device)
+			continue
+		}
+		if fs != "" {
+			logger.Infof("skipping device %s since it has file system %s", device, fs)
+			continue
+		}
+		if strings.HasPrefix(device, "rbd") {
+			logger.Infof("skipping unexpected rbd device: %s", device)
+			continue
+		}
+		logger.Infof("available device: %s", device)
+		disks++
+	}
+	if disks > 0 {
+		return true
+	}
+	logger.Info("No additional disks found on cluster")
+	return false
 }

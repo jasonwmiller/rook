@@ -31,7 +31,7 @@ type S3Helper struct {
 	s3client *s3.S3
 }
 
-// CreateNewS3Helper creates a s3 client for specfied endpoint and creds
+// CreateNewS3Helper creates a s3 client for specified endpoint and creds
 func CreateNewS3Helper(endpoint string, keyID string, keySecret string) *S3Helper {
 
 	creds := credentials.NewStaticCredentials(keyID, keySecret, "")
@@ -106,7 +106,7 @@ func (h *S3Helper) GetObjectInBucket(bucketname string, key string) (string, err
 
 	if err != nil {
 		logger.Errorf("error encountered while retrieving object from bucket : %v", err)
-		return "ERROR_ OBJCET NOT FOUND", err
+		return "ERROR_ OBJECT NOT FOUND", err
 
 	}
 	buf := new(bytes.Buffer)
@@ -127,4 +127,17 @@ func (h *S3Helper) DeleteObjectInBucket(bucketname string, key string) (bool, er
 
 	}
 	return true, nil
+}
+
+//IsBucketPresent function returns true if a bucket is present and false if it's not present
+func (h *S3Helper) IsBucketPresent(bucketname string) (bool, error) {
+	_, err := h.s3client.HeadBucket(&s3.HeadBucketInput{
+		Bucket: aws.String(bucketname),
+	})
+	if err != nil && strings.Contains(err.Error(), "NotFound") {
+		return false, nil
+	} else if err == nil {
+		return true, nil
+	}
+	return false, err
 }

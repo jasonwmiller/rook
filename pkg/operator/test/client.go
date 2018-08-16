@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -29,8 +30,23 @@ func New(nodes int) *fake.Clientset {
 	clientset := fake.NewSimpleClientset()
 	for i := 0; i < nodes; i++ {
 		ready := v1.NodeCondition{Type: v1.NodeReady}
-		n := &v1.Node{Status: v1.NodeStatus{Conditions: []v1.NodeCondition{ready}}}
-		n.Name = fmt.Sprintf("node%d", i)
+		name := fmt.Sprintf("node%d", i)
+		n := &v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+			},
+			Status: v1.NodeStatus{
+				Conditions: []v1.NodeCondition{
+					ready,
+				},
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeExternalIP,
+						Address: fmt.Sprintf("%d.%d.%d.%d", i, i, i, i),
+					},
+				},
+			},
+		}
 		clientset.CoreV1().Nodes().Create(n)
 	}
 	return clientset

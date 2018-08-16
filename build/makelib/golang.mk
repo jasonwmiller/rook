@@ -49,27 +49,26 @@ GO_TEST_FLAGS ?=
 # ====================================================================================
 # Setup go environment
 
-GO_SUPPORTED_VERSIONS ?= 1.7|1.8|1.9
+GO_SUPPORTED_VERSIONS ?= 1.7|1.8|1.9|1.10
 
 GO_PACKAGES := $(foreach t,$(GO_SUBDIRS),$(GO_PROJECT)/$(t)/...)
-GO_INTEGRATION_TEST_PACKAGES := $(foreach t,$(GO_INTEGRATION_TESTS_SUBDIRS),$(GO_PROJECT)/$(t)/...)
+GO_INTEGRATION_TEST_PACKAGES := $(foreach t,$(GO_INTEGRATION_TESTS_SUBDIRS),$(GO_PROJECT)/$(t)/integration)
 
 ifneq ($(GO_TEST_SUITE),)
 GO_TEST_FLAGS += -run '$(GO_TEST_SUITE)'
 endif
 
+ifneq ($(GO_TEST_FILTER),)
+TEST_FILTER_PARAM := -testify.m '$(GO_TEST_FILTER)'
+endif
+
 GOPATH := $(shell go env GOPATH)
 
 # setup tools used during the build
-GLIDE_VERSION=v0.12.3
-GLIDE_HOME := $(abspath $(CACHE_DIR)/glide)
-GLIDE := $(TOOLS_HOST_DIR)/glide-$(GLIDE_VERSION)
-GLIDE_YAML := $(ROOT_DIR)/glide.yaml
-GLIDE_LOCK := $(ROOT_DIR)/glide.lock
-GLIDE_INSTALL_STAMP := $(GO_VENDOR_DIR)/vendor.stamp
+DEP_VERSION=v0.4.1
+DEP := $(TOOLS_HOST_DIR)/dep-$(DEP_VERSION)
 GOLINT := $(TOOLS_HOST_DIR)/golint
 GOJUNIT := $(TOOLS_HOST_DIR)/go-junit-report
-export GLIDE_HOME
 
 GO := go
 GOHOST := GOOS=$(GOHOSTOS) GOARCH=$(GOHOSTARCH) go
@@ -111,37 +110,19 @@ endif
 endif
 
 .PHONY: go.init
-go.init: $(GLIDE_INSTALL_STAMP)
+go.init: go.vendor.lite
 	@:
 
-define go.project
-go.build.packages.$(1):
-	@echo === go build $(1) $(PLATFORM)
-	@$(3) $(GO) build -v -i -o $(GO_OUT_DIR)/$(1)$(GO_OUT_EXT) $(4) $(2)
-
-go.build.packages: go.build.packages.$(1)
-
-go.install.packages.$(1):
-	@echo === go install $(1) $(PLATFORM)
-	@$(3) $(GO) install -v $(4) $(2)
-go.install.packages: go.install.packages.$(1)
-endef
-$(foreach p,$(GO_STATIC_PACKAGES),$(eval $(call go.project,$(lastword $(subst /, ,$(p))),$(p),CGO_ENABLED=0,$(GO_STATIC_FLAGS))))
-
-define go.test.project
-go.build.test.packages.$(1):
-	@echo === go build test $(1) $(PLATFORM)
-	@$(3) $(GO) test -v -i -c -o $(GO_TEST_OUTPUT)/$(1)$(GO_OUT_EXT) $(4) $(2)
-
-go.build.test.packages: go.build.test.packages.$(1)
-endef
-$(foreach p,$(GO_TEST_PACKAGES),$(eval $(call go.test.project,$(lastword $(subst /, ,$(p))),$(p),CGO_ENABLED=0,$(GO_STATIC_FLAGS))))
-
 .PHONY: go.build
-go.build: go.build.packages go.build.test.packages
+go.build:
+	@echo === go build $(PLATFORM)
+	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=0 $(GO) build -v -i -o $(GO_OUT_DIR)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p)${\n})
+	$(foreach p,$(GO_TEST_PACKAGES) $(GO_LONGHAUL_TEST_PACKAGES),@CGO_ENABLED=0 $(GO) test -v -i -c -o $(GO_TEST_OUTPUT)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p)${\n})
 
 .PHONY: go.install
-go.install: go.install.packages
+go.install:
+	@echo === go install $(PLATFORM)
+	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=0 $(GO) install -v $(GO_STATIC_FLAGS) $(p)${\n})
 
 .PHONY: go.test.unit
 go.test.unit: $(GOJUNIT)
@@ -156,7 +137,7 @@ go.test.integration: $(GOJUNIT)
 	@echo === go test integration-tests
 	@mkdir -p $(GO_TEST_OUTPUT)
 	@CGO_ENABLED=0 $(GOHOST) test -v -i $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES)
-	@CGO_ENABLED=0 $(GOHOST) test -v $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES) 2>&1 | tee $(GO_TEST_OUTPUT)/integration-tests.log
+	@CGO_ENABLED=0 $(GOHOST) test -v $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES) $(TEST_FILTER_PARAM) 2>&1 | tee $(GO_TEST_OUTPUT)/integration-tests.log
 	@cat $(GO_TEST_OUTPUT)/integration-tests.log | $(GOJUNIT) -set-exit-code > $(GO_TEST_OUTPUT)/integration-tests.xml
 
 .PHONY: go.lint
@@ -175,22 +156,30 @@ go.fmt:
 
 go.validate: go.vet go.fmt
 
-go.vendor: $(GLIDE) $(GLIDE_YAML)
-	@echo === updating vendor dependencies
-	@mkdir -p $(GLIDE_HOME)
-	@$(GLIDE) update --strip-vendor
+.PHONY: go.vendor.lite
+go.vendor.lite: $(DEP)
+#	dep ensure blindly updates the whole vendor tree causing everything to be rebuilt. This workaround
+#	will only call dep ensure if the .lock file changes or if the vendor dir is non-existent.
+	@if [ ! -d $(GO_VENDOR_DIR) ] || [ ! $(DEP) ensure -no-vendor -dry-run &> /dev/null ]; then \
+		echo === updating vendor dependencies ;\
+		$(DEP) ensure ;\
+	fi
 
-$(GLIDE_INSTALL_STAMP): $(GLIDE) $(GLIDE_LOCK)
-	@echo === installing vendor dependencies
-	@mkdir -p $(GLIDE_HOME)
-	@$(GLIDE) install --strip-vendor
-	@touch $@
+.PHONY: go.vendor
+go.vendor: $(DEP)
+	@echo === ensuring vendor dependencies are up to date
+	@$(DEP) ensure
 
-$(GLIDE):
-	@echo === installing glide
+$(DEP):
+	@echo === installing dep
 	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@curl -sL https://github.com/Masterminds/glide/releases/download/$(GLIDE_VERSION)/glide-$(GLIDE_VERSION)-$(GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
-	@mv $(TOOLS_HOST_DIR)/tmp/$(GOHOSTOS)-$(GOHOSTARCH)/glide $(GLIDE)
+	@if [ "$(GOHOSTARCH)" = "arm64" ]; then\
+		GOPATH=$(TOOLS_HOST_DIR)/tmp GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get -u github.com/golang/dep/cmd/dep;\
+		mv $(TOOLS_HOST_DIR)/dep $@;\
+	else \
+		curl -sL -o $(DEP) https://github.com/golang/dep/releases/download/$(DEP_VERSION)/dep-$(GOHOSTOS)-$(GOHOSTARCH);\
+	fi
+	@chmod +x $(DEP)
 	@rm -fr $(TOOLS_HOST_DIR)/tmp
 
 $(GOLINT):
@@ -207,5 +196,4 @@ $(GOJUNIT):
 
 .PHONY: go.distclean
 go.distclean:
-	@rm -rf $(GLIDE_INSTALL_STAMP) $(GO_VENDOR_DIR)
-
+	@rm -rf $(GO_VENDOR_DIR)

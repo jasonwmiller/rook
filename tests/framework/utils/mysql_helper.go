@@ -18,9 +18,11 @@ package utils
 
 import (
 	"database/sql"
+	"fmt"
 	"math/rand"
 	"strconv"
 	"time"
+
 	// import mysql driver
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/icrowley/fake"
@@ -31,7 +33,7 @@ type MySQLHelper struct {
 	DB *sql.DB
 }
 
-// CreateNewMySQLHelper creates a s3 client for specfied endpoint and creds
+// CreateNewMySQLHelper creates a s3 client for specified endpoint and creds
 func CreateNewMySQLHelper(username string, password string, url string, dbname string) *MySQLHelper {
 	dataSourceName := username + ":" + password + "@tcp(" + url + ")/" + dbname
 	db, err := sql.Open("mysql", dataSourceName)
@@ -66,7 +68,7 @@ func (h *MySQLHelper) PingSuccess() bool {
 
 //CreateTable func create sample Table
 func (h *MySQLHelper) CreateTable() sql.Result {
-	result, err := h.DB.Exec("CREATE TABLE LONGHAUL (id int NOT NULL AUTO_INCREMENT,number int,data varchar(32)" +
+	result, err := h.DB.Exec("CREATE TABLE LONGHAUL (id int NOT NULL AUTO_INCREMENT,number int,data1 varchar(10000),data2 varchar(10000),data3 varchar(10000),data4 varchar(10000),data5 varchar(10000)" +
 		", PRIMARY KEY (id) )")
 	if err != nil {
 		panic(err)
@@ -75,14 +77,14 @@ func (h *MySQLHelper) CreateTable() sql.Result {
 }
 
 //InsertRandomData Inserts random Data into the table
-func (h *MySQLHelper) InsertRandomData() sql.Result {
-	stmtIns, err := h.DB.Prepare("INSERT INTO LONGHAUL (number, data) VALUES ( ?, ? )") // ? = placeholder
+func (h *MySQLHelper) InsertRandomData(dataSize int) sql.Result {
+	stmtIns, err := h.DB.Prepare("INSERT INTO LONGHAUL (number, data1, data2, data3, data4, data5) VALUES ( ?, ?, ?, ?, ? )") // ? = placeholder
 	if err != nil {
 		panic(err)
 	}
 	defer stmtIns.Close()
 
-	result, err := stmtIns.Exec(rand.Intn(100000000), fake.CharactersN(20))
+	result, err := stmtIns.Exec(rand.Intn(100000000), fake.CharactersN(dataSize), fake.CharactersN(dataSize), fake.CharactersN(dataSize), fake.CharactersN(dataSize), fake.CharactersN(dataSize))
 	if err != nil {
 		panic(err)
 	}
@@ -91,11 +93,24 @@ func (h *MySQLHelper) InsertRandomData() sql.Result {
 }
 
 //TableRowCount gets row count of table
+func (h *MySQLHelper) SelectRandomData(limit int) *sql.Rows {
+	query := fmt.Sprintf("SELECT * FROM  LONGHAUL ORDER BY RAND() LIMIT %d", limit)
+	rows, err := h.DB.Query(query)
+	if err != nil {
+		panic(err)
+	}
+	defer rows.Close()
+
+	return rows
+}
+
+//TableRowCount gets row count of table
 func (h *MySQLHelper) TableRowCount() (count int) {
 	rows, err := h.DB.Query("SELECT COUNT(*) as count FROM LONGHAUL")
 	if err != nil {
 		panic(err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		err := rows.Scan(&count)
 		if err != nil {
@@ -103,7 +118,6 @@ func (h *MySQLHelper) TableRowCount() (count int) {
 		}
 	}
 	return count
-
 }
 
 //TableExists checks if a table exists
@@ -122,6 +136,8 @@ func (h *MySQLHelper) DeleteRandomRow() sql.Result {
 	if err != nil {
 		panic(err)
 	}
+	defer rows.Close()
+
 	for rows.Next() {
 		err := rows.Scan(&id)
 		if err != nil {

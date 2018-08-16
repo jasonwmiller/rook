@@ -58,11 +58,10 @@ endif
 DOCKER_REGISTRY ?= rook
 QUAY_REGISTRY ?= quay.io/rook
 REGISTRIES ?= $(DOCKER_REGISTRY) $(QUAY_REGISTRY)
-IMAGES ?= rook toolbox
 IMAGE_ARCHS := $(subst linux_,,$(filter linux_%,$(PLATFORMS)))
 IMAGE_PLATFORMS := $(subst _,/,$(subst $(SPACE),$(COMMA),$(filter linux_%,$(PLATFORMS))))
 
-S3_BUCKET ?= rook-release
+S3_BUCKET ?= rook.release
 S3_CP := aws s3 cp --only-show-errors
 S3_SYNC := aws s3 sync --only-show-errors
 S3_SYNC_DEL := aws s3 sync --only-show-errors --delete
@@ -70,7 +69,7 @@ S3_SYNC_DEL := aws s3 sync --only-show-errors --delete
 # ====================================================================================
 # tools
 
-MANIFEST_TOOL_VERSION=v0.6.0
+MANIFEST_TOOL_VERSION=v0.7.0
 MANIFEST_TOOL := $(TOOLS_HOST_DIR)/manifest-tool-$(MANIFEST_TOOL_VERSION)
 
 $(MANIFEST_TOOL):

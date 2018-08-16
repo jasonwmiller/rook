@@ -50,14 +50,12 @@ PLATFORMS ?= $(ALL_PLATFORMS)
 SERVER_PLATFORMS := $(filter linux_%,$(PLATFORMS))
 CLIENT_PLATFORMS := $(filter-out linux_%,$(PLATFORMS))
 
-# client projects that we build on all platforms
-CLIENT_PACKAGES = $(GO_PROJECT)/cmd/rookctl
-
 # server projects that we build on server platforms
-SERVER_PACKAGES = $(GO_PROJECT)/cmd/rook
+SERVER_PACKAGES = $(GO_PROJECT)/cmd/rook $(GO_PROJECT)/cmd/rookflex
 
 # tests packages that will be compiled into binaries
-TEST_PACKAGES = $(GO_PROJECT)/tests/smoke
+TEST_PACKAGES = $(GO_PROJECT)/tests/integration
+LONGHAUL_TEST_PACKAGES = $(GO_PROJECT)/tests/longhaul
 
 # the root go project
 GO_PROJECT=github.com/rook/rook
@@ -82,8 +80,10 @@ GO_LDFLAGS=$(LDFLAGS)
 GO_TAGS=$(TAGS)
 
 GO_TEST_PACKAGES=$(TEST_PACKAGES)
+GO_LONGHAUL_TEST_PACKAGES=$(LONGHAUL_TEST_PACKAGES)
 GO_TEST_FLAGS=$(TESTFLAGS)
 GO_TEST_SUITE=$(SUITE)
+GO_TEST_FILTER=$(TESTFILTER)
 
 include build/makelib/golang.mk
 
@@ -110,11 +110,14 @@ build: build.common
 	@$(MAKE) go.build
 # if building on non-linux platforms, also build the linux container
 ifneq ($(GOOS),linux)
-	@$(MAKE) go.build PLATFORM=linux_amd64
+	@$(MAKE) go.build PLATFORM=linux_$(GOHOSTARCH)
 endif
-	@$(MAKE) -C images PLATFORM=linux_amd64
+	@$(MAKE) -C images PLATFORM=linux_$(GOHOSTARCH)
 
 build.all: build.common
+ifneq ($(GOHOSTARCH),amd64)
+	$(error cross platform image build only supported on amd64 host currently)
+endif
 	@$(MAKE) do.build.parallel
 	@$(MAKE) -C images build.all
 
@@ -139,6 +142,9 @@ fmt:
 	@$(MAKE) go.init
 	@$(MAKE) go.fmt
 
+codegen:
+	@build/codegen/codegen.sh
+
 vendor: go.vendor
 
 clean:
@@ -152,38 +158,45 @@ prune:
 	@$(MAKE) -C images prune
 
 .PHONY: all build.common cross.build.parallel
-.PHONY: build build.all install test check vet fmt vendor clean distclean prune
+.PHONY: build build.all install test check vet fmt codegen vendor clean distclean prune
 
 # ====================================================================================
 # Help
 
+define HELPTEXT
+Usage: make <OPTIONS> ... <TARGETS>
+
+Targets:
+    build              Build source code for host platform.
+    build.all          Build source code for all platforms.
+                       Best done in the cross build container
+                       due to cross compiler dependencies.
+    check              Runs unit tests.
+    clean              Remove all files that are created by building.
+    codegen            Run code generators.
+    distclean          Remove all files that are created
+                       by building or configuring.
+    fmt                Check formatting of go sources.
+    lint               Check syntax and styling of go sources.
+    help               Show this help info.
+    prune              Prune cached artifacts.
+    test               Runs unit tests.
+    test-integration   Runs integration tests.
+    vendor             Update vendor dependencies.
+    vet                Runs lint checks on go sources.
+
+Options:
+    DEBUG        Whether to generate debug symbols. Default is 0.
+    IMAGES       Backend images to make. All by default. See: /rook/images/ dir
+    PLATFORM     The platform to build.
+    SUITE        The test suite to run.
+    TESTFILTER   Tests to run in a suite.
+    VERSION      The version information compiled into binaries.
+                 The default is obtained from git.
+    V            Set to 1 enable verbose build. Default is 0.
+
+endef
+export HELPTEXT
 .PHONY: help
 help:
-	@echo 'Usage: make <OPTIONS> ... <TARGETS>'
-	@echo ''
-	@echo 'Targets:'
-	@echo '    build              Build source code for host platform.'
-	@echo '    build.all          Build source code for all platforms.'
-	@echo '                       Best done in the cross build container'
-	@echo '                       due to cross compiler dependencies.'
-	@echo '    check              Runs unit tests.'
-	@echo '    clean              Remove all files that are created '
-	@echo '                       by building.'
-	@echo '    distclean          Remove all files that are created '
-	@echo '                       by building or configuring.'
-	@echo '    fmt                Check formatting of go sources.'
-	@echo '    lint               Check syntax and styling of go sources.'
-	@echo '    help               Show this help info.'
-	@echo '    prune              Prune cached artifacts.'
-	@echo '    test               Runs unit tests.'
-	@echo '    test-integration   Runs integration tests.'
-	@echo '    vendor             Update vendor dependencies.'
-	@echo '    vet                Runs lint checks on go sources.'
-	@echo ''
-	@echo 'Options:'
-	@echo '    DEBUG        Whether to generate debug symbols. Default is 0.'
-	@echo '    PLATFORM     The platform to build.'
-	@echo '    SUITE        The test suite to run.'
-	@echo '    VERSION      The version information compiled into binaries.'
-	@echo '                 The default is obtained from git.'
-	@echo '    V            Set to 1 enable verbose build. Default is 0.'
+	@echo "$$HELPTEXT"

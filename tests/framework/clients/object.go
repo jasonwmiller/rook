@@ -17,80 +17,73 @@ limitations under the License.
 package clients
 
 import (
-	"github.com/rook/rook/pkg/model"
-	"github.com/rook/rook/tests/framework/contracts"
+	"fmt"
+
+	"github.com/coreos/pkg/capnslog"
+	"github.com/rook/rook/tests/framework/utils"
 )
 
-//ObjectOperation is wrapper for k8s rook object operations
+const rgwPort = 53390
+
+var logger = capnslog.NewPackageLogger("github.com/rook/rook/tests", "clients")
+
+// ObjectOperation is wrapper for k8s rook object operations
 type ObjectOperation struct {
-	restClient contracts.RestAPIOperator
+	k8sh *utils.K8sHelper
 }
 
-//CreateObjectOperation creates new rook object client
-func CreateObjectOperation(rookRestClient contracts.RestAPIOperator) *ObjectOperation {
-	return &ObjectOperation{restClient: rookRestClient}
+// CreateObjectOperation creates new rook object client
+func CreateObjectOperation(k8sh *utils.K8sHelper) *ObjectOperation {
+	return &ObjectOperation{k8sh: k8sh}
 }
 
-//ObjectCreate Function to create a object store in rook
-//Input paramatres -None
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectCreate() (string, error) {
-	store := model.ObjectStore{Name: "default", RGWReplicas: 1}
-	store.DataConfig.ReplicationConfig.Size = 1
-	store.MetadataConfig.ReplicationConfig.Size = 1
-	return ro.restClient.CreateObjectStore(store)
+// ObjectCreate Function to create a object store in rook
+func (ro *ObjectOperation) Create(namespace, storeName string, replicaCount int32) error {
+
+	logger.Infof("creating the object store via CRD")
+	storeSpec := fmt.Sprintf(`apiVersion: ceph.rook.io/v1beta1
+kind: ObjectStore
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  metadataPool:
+    replicated:
+      size: 1
+  dataPool:
+    replicated:
+      size: 1
+  gateway:
+    type: s3
+    sslCertificateRef:
+    port: %d
+    securePort:
+    instances: %d
+    allNodes: false
+`, storeName, namespace, rgwPort, replicaCount)
+
+	if _, err := ro.k8sh.ResourceOperation("create", storeSpec); err != nil {
+		return err
+	}
+
+	err := ro.k8sh.WaitForLabeledPodToRun(fmt.Sprintf("rook_object_store=%s", storeName), namespace)
+	if err != nil {
+		return fmt.Errorf("rgw did not start via crd. %+v", err)
+	}
+
+	// create the external service
+	return ro.k8sh.CreateExternalRGWService(namespace, storeName)
 }
 
-//ObjectBucketList Function to get Buckets present in rook object store
-//Input paramatres - None
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectBucketList() ([]model.ObjectBucket, error) {
-	return ro.restClient.ListBuckets()
+func (ro *ObjectOperation) Delete(namespace, storeName string) error {
 
-}
+	logger.Infof("Deleting the object store via CRD")
+	if _, err := ro.k8sh.DeleteResource("-n", namespace, "ObjectStore", storeName); err != nil {
+		return err
+	}
 
-//ObjectConnection Function to get connection information for a user
-//Input paramatres - None
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectConnection() (*model.ObjectStoreConnectInfo, error) {
-	return ro.restClient.GetObjectStoreConnectionInfo()
-
-}
-
-//ObjectCreateUser Function to create user on rook object store
-//Input paramatres - userId and display Name
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectCreateUser(userid string, displayname string) (*model.ObjectUser, error) {
-	objectUser := model.ObjectUser{UserID: userid, DisplayName: &displayname}
-	return ro.restClient.CreateObjectUser(objectUser)
-
-}
-
-//ObjectUpdateUser Function to update a user on rook object store
-//Input paramatres - userId,display Name and email address
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectUpdateUser(userid string, displayname string, emailid string) (*model.ObjectUser, error) {
-	objectUser := model.ObjectUser{UserID: userid, DisplayName: &displayname, Email: &emailid}
-	return ro.restClient.UpdateObjectUser(objectUser)
-}
-
-//ObjectDeleteUser Function to delete user on rook object store
-//Input paramatres - userId
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectDeleteUser(userid string) error {
-	return ro.restClient.DeleteObjectUser(userid)
-}
-
-//ObjectGetUser Function to get a user on rook object store
-//Input paramatres - userId
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectGetUser(userid string) (*model.ObjectUser, error) {
-	return ro.restClient.GetObjectUser(userid)
-}
-
-//ObjectListUser Function to get all users on rook object store
-//Input paramatres - none
-//Output - output returned by rook Rest API client
-func (ro *ObjectOperation) ObjectListUser() ([]model.ObjectUser, error) {
-	return ro.restClient.ListObjectUsers()
+	if !ro.k8sh.WaitUntilPodWithLabelDeleted(fmt.Sprintf("rook_object_store=%s", storeName), namespace) {
+		return fmt.Errorf("rgw did not stop via crd")
+	}
+	return nil
 }
